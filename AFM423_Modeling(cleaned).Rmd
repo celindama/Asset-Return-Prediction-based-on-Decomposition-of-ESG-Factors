@@ -1,0 +1,586 @@
+---
+title: "AFM423_Modeling"
+output: pdf_document
+date: "2023-04-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)                      # Activate the data science package
+library(lubridate)                      # Activate the date management package
+library(randomForest)                   # Package for random forests
+library(tidyquant)
+library(readxl)
+library(ggcorrplot)
+library(timetk)
+library(quantmod)
+library(keras)
+library(tensorflow)
+library(glmnet)  
+library(dplyr)
+library(tibble)
+```
+
+```{r}
+data_tr <- read.csv("TR_complete.csv")
+data_tr <- data_tr %>%
+  arrange(FisYear, tick) %>%
+  select(-X)
+
+data_tr$overall_score_bc <- box_cox_vec(data_tr$overall_score)
+```
+Simple linear regression
+```{r}
+ggplot(data_tr, aes(overall_score_bc, return)) +
+  xlab('overall score (box-coxed)') +
+  labs(title = 'Return by ESG score') + 
+  theme(plot.title = element_text(hjust = 0.5, size = 16)) +
+  geom_point() +  # Add points
+  geom_smooth(method = "lm", se = FALSE)
+```
+```{r}
+simple_linear <- lm(return~overall_score_bc, data = data_tr)
+summary(simple_linear)
+mean((resid(simple_linear))^2)
+mean(abs(resid(simple_linear)))
+```
+Splitting training and test set (for regression)
+```{r message=FALSE, warning=FALSE}
+features_short <- c("envrn_score", "corpgov_score", "social_score", 'ControversiesScore') #used the new edition, where Econ score is removed and controversies score is added
+features_long <- c('ControversiesScore',
+                   'ResourceUseScore', 'EmissionsScore','InnovationScore', #Environmental
+                   'WorkforceScore', 'HumanRightsScore','CommunityScore', 'ProductRespScore', #Social
+                   'ManagementScore', 'ShareholdersScore', 'CSRStrategyScore' # Governance
+                   )
+
+
+data_bc <- data_tr %>%
+  select(-return) %>% 
+  group_by(FisYear) %>%
+  mutate_if(is.numeric, box_cox_vec) %>%
+  ungroup() %>%
+  arrange(FisYear, tick)
+data_bc$return <- data_tr$return
+
+separation_year <- 2018
+training_sample <- filter(data_bc, FisYear < separation_year)
+testing_sample <- filter(data_bc, FisYear >= separation_year)
+```
+
+```{r}
+data_bc %>%
+  select(c(ControversiesScore, ResourceUseScore, EmissionsScore, InnovationScore,
+           WorkforceScore, HumanRightsScore, CommunityScore, ProductRespScore, ManagementScore,
+           ShareholdersScore, CSRStrategyScore)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "Attribute", values_to = "Value") %>% # Convert to 'compact' colu
+  ggplot(aes(x = Value, fill = Attribute)) +
+  geom_histogram() + theme_light() + # Plot histograms
+  facet_grid(Attribute~., scales = "free") # Stack the histograms
+```
+
+
+LASSO
+```{r}
+y_penalized_train <- training_sample$return                              # Dependent variable
+x_penalized_train_short <- training_sample %>%                                  # Predictors
+    dplyr::select(all_of(features_short)) %>% as.matrix()
+y_penalized_test <- testing_sample$return
+x_penalized_test_short <- testing_sample %>%                                  # Predictors
+    dplyr::select(all_of(features_short)) %>% as.matrix()
+fit_lasso_short <- glmnet(x_penalized_train_short, y_penalized_train, alpha = 1)    # Model alpha = 1: LASSO
+
+cv_model_short <- cv.glmnet(x_penalized_train_short, y_penalized_train, alpha = 1)
+lambda_min_short <- cv_model_short$lambda.min
+
+lasso_coef_short <- coef(fit_lasso_short, s = lambda_min_short)
+
+best.lasso.short = glmnet( x_penalized_train_short, y_penalized_train, alpha=1 , 
+                        lambda= lambda_min_short)
+lasso_predictions_short <- predict(best.lasso.short, newx = x_penalized_test_short)
+mse_short <- mean((y_penalized_test - lasso_predictions_short)^2)
+mae_short <- mean(abs(y_penalized_test - lasso_predictions_short))
+mse_short
+mae_short
+
+plot(lasso_predictions_short, testing_sample$return,
+     col = adjustcolor('black', alpha = 0.2), pch = 19,
+     cex = 0.75,
+     xlab = 'lasso short prediction', ylab = 'actual return',
+     main = 'actual return vs. LASSO short prediction')
+abline(a = 0, b = 1, col = "red",lwd = 2)
+```
+
+```{r}
+lasso_res_short <- summary(fit_lasso_short$beta)                        # Extract LASSO coefs
+lambda_short <- fit_lasso_short$lambda                                  # Values of the penalisation const
+lasso_res_short$Lambda <- lambda_short[lasso_res_short$j]                     # Put the labels where they belong
+lasso_res_short$Feature <- features_short[lasso_res_short$i] %>% as.factor()  # Add names of variables to output
+lasso_res_short[1:120,] %>%                                       # Take the first 120 estimates
+    ggplot(aes(x = Lambda, y = x, color = Feature)) +       # Plot!
+    geom_line(size = 0.75) + coord_fixed(0.75) + ylab("beta") +        # Change aspect ratio of graph
+    theme(legend.text = element_text(size = 10), plot.margin = unit(c(0.1,1,0.1,1),'cm'))
+```
+
+```{r}
+x_penalized_train_long <- training_sample %>%                                  # Predictors
+    dplyr::select(all_of(features_long)) %>% as.matrix() 
+x_penalized_test_long <- testing_sample %>%                                  # Predictors
+    dplyr::select(all_of(features_long)) %>% as.matrix() 
+fit_lasso_long <- glmnet(x_penalized_train_long, y_penalized_train, alpha = 1)    # Model alpha = 1: LASSO
+
+cv_model_long <- cv.glmnet(x_penalized_train_long, y_penalized_train, alpha = 1)
+lambda_min_long <- cv_model_long$lambda.min
+
+lasso_coef_long <- coef(fit_lasso_long, s = lambda_min_long )
+
+best.lasso.long = glmnet(x_penalized_train_long, y_penalized_train, alpha=1 , 
+                        lambda= lambda_min_long)
+
+lasso_predictions_long <- predict(best.lasso.long, newx = x_penalized_test_long)
+mse_long <- mean((y_penalized_test - lasso_predictions_long)^2)
+mae_long <- mean(abs(y_penalized_test - lasso_predictions_long))
+mse_long
+mae_long
+
+plot(lasso_predictions_long, testing_sample$return,
+     col = adjustcolor('black', alpha = 0.2), pch = 19,
+     cex = 0.75,
+     xlab = 'lasso long prediction', ylab = 'actual return',
+     main = 'actual return vs. LASSO long prediction')
+abline(a = 0, b = 1, col = "red",lwd = 2)
+
+```
+
+```{r}
+lasso_res_long <- summary(fit_lasso_long$beta)                        # Extract LASSO coefs
+lambda_long <- fit_lasso_long$lambda                                  # Values of the penalisation const
+lasso_res_long$Lambda <- lambda_long[lasso_res_long$j]                     # Put the labels where they belong
+lasso_res_long$Feature <- features_long[lasso_res_long$i] %>% as.factor()  # Add names of variables to output
+lasso_res_long[1:600,] %>%                                       # Take the first 120 estimates
+    ggplot(aes(x = Lambda, y = x, color = Feature)) +       # Plot!
+    geom_line(size = 0.75) + coord_fixed(0.25) + ylab("beta") +        # Change aspect ratio of graph
+    theme(legend.text = element_text(size = 10))             # Reduce legend font size
+```
+Random forest
+```{r}
+formula_short <- paste("return ~", paste(features_short, collapse = " + ")) %>% # Defines the model 
+  as.formula()
+formula_long <- paste("return ~", paste(features_long, collapse = " + ")) %>% # Defines the model 
+  as.formula()
+```
+
+```{r}
+fit_RF_short <- randomForest(formula_short,             # Same formula as for simple trees!
+                 data = training_sample,    # Data source: training sample
+                 sampsize = 1000,          # Size of (random) sample for each tree
+                 replace = FALSE,           # Is the sampling done with replacement?
+                 nodesize = 400,            # Minimum size of terminal cluster
+                 ntree = 50,                # Nb of random trees
+                 mtry = 3                  # Nb of predictive variables for each tree
+    )
+RF_short_prediction <- predict(fit_RF_short, testing_sample)
+
+mean((RF_short_prediction - testing_sample$return)^2) # MSE
+mean(abs(RF_short_prediction - testing_sample$return))
+
+plot(RF_short_prediction, testing_sample$return,
+     col = adjustcolor('black', alpha = 0.2), pch = 19,
+     cex = 0.75,
+     xlab = 'RF short prediction', ylab = 'actual return',
+     main = 'actual return vs. RF short prediction')
+abline(a = 0, b = 1, col = "red",lwd = 2)
+```
+
+```{r}
+RF_short_importance <- data.frame(features = features_short, # We store these results for later on
+                            importance = matrix(fit_RF_short$importance)/sum(fit_RF_short$importance),
+                            model = "Random Forest") # Model names
+
+RF_short_sorted <- RF_short_importance %>% 
+  arrange(importance) %>% 
+  mutate(x = factor(features, levels = features))
+
+# Create bar plot with sorted dataframe
+ggplot(data = RF_short_sorted, aes(x = x, y = importance)) +
+  geom_bar(stat = "identity", fill = c('grey', 'lightblue', 'purple', 'lightgreen'), color = 'black') +
+  geom_text(aes(label = round(importance,4)), vjust = -0.5) + 
+  xlab('factors') +
+  labs(title = 'Importance of 4 factors') +
+  theme(plot.title = element_text(hjust = 0.5, size = 16),axis.text.x = element_text(size = 12))
+```
+
+```{r}
+fit_RF_long <- randomForest(formula_long,             # Same formula as for simple trees!
+                 data = training_sample,    # Data source: training sample
+                 sampsize = 1000,          # Size of (random) sample for each tree
+                 replace = FALSE,           # Is the sampling done with replacement?
+                 nodesize = 400,            # Minimum size of terminal cluster
+                 ntree = 50,                # Nb of random trees
+                 mtry = 3                  # Nb of predictive variables for each tree
+    )
+RF_long_prediction <- predict(fit_RF_long, testing_sample)
+
+mean((RF_long_prediction - testing_sample$return)^2)
+mean(abs(RF_long_prediction - testing_sample$return))
+
+plot(RF_long_prediction, testing_sample$return,
+     col = adjustcolor('black', alpha = 0.2), pch = 19,
+     cex = 0.75,
+     xlab = 'RF long prediction', ylab = 'actual return',
+     main = 'actual return vs. RF long prediction')
+abline(a = 0, b = 1, col = "red",lwd = 2)
+
+
+```
+
+```{r}
+RF_long_importance <- data.frame(features = features_long, # We store these results for later on
+                            importance = matrix(fit_RF_long$importance)/sum(fit_RF_long$importance),
+                            model = "Random Forest") # Model names
+
+RF_long_sorted <- RF_long_importance %>% 
+  mutate(short_f = substr(features, 1, nchar(features) - 5)) %>%
+  arrange(importance) %>% 
+  mutate(x = factor(short_f, levels = short_f))
+
+ggplot(data = RF_long_sorted, aes(x = x, y = importance)) +
+  geom_bar(stat = "identity", fill = c('purple', 'lightblue', 'lightgreen', 'purple', 'grey','purple', 'lightgreen', 'lightblue', 'lightgreen', 'lightblue', 'purple'), color = 'black') +
+  geom_text(aes(label = round(importance,4)), vjust = -0.5) + 
+  xlab('factors') +
+  labs(title = 'Importance of 11 factors') +
+  theme(plot.title = element_text(hjust = 0.5, size = 16),axis.text.x = element_text(size = 6))
+```
+
+ANN
+```{r}
+normalise <- function(v){ # This is a function that 'uniformalizes' a vector
+  v <- v %>% as.matrix()
+  return(ecdf(v)(v))
+}
+
+data_norm <- data_tr %>%
+  select(-return) %>%
+  group_by(FisYear) %>%
+  mutate_if(is.numeric, normalise) %>%
+  ungroup() %>%
+  arrange(FisYear, tick)
+data_norm$return <- data_tr$return
+
+```
+
+
+```{r}
+stock_ids <- levels(as.factor(data_tr$tick)) # A list of all stock_ids
+stock_yrs <- data_tr %>%                        # Compute the number of data points per stock
+    group_by(tick) %>% summarise(nb = n()) 
+stock_ids_short <- stock_ids[which(stock_yrs$nb == max(stock_yrs$nb))] # Stocks with full data, just in case there is mistake in data processing step
+
+separation_year <- 2018
+training_sample <- filter(data_norm, FisYear < separation_year)
+testing_sample <- filter(data_norm, FisYear >= separation_year)
+```
+
+
+```{r}
+NN_train_features_short <- dplyr::select(training_sample,all_of(features_short)) %>% as.matrix()
+NN_train_features_long <- dplyr::select(training_sample,all_of(features_long)) %>% as.matrix()
+NN_train_labels <- training_sample$return # Training labels
+
+NN_test_features_short <- dplyr::select(testing_sample, all_of(features_short)) %>% as.matrix()
+NN_test_features_long <- dplyr::select(testing_sample, all_of(features_long)) %>% as.matrix()
+NN_test_labels <- testing_sample$return # Testing labels
+```
+
+
+ANN_short
+```{r}
+model_ML_short <- keras_model_sequential()
+model_ML_short %>% # This defines the structure of the network, i.e. how layers are organized
+  layer_dense(units = 1, activation = 'relu', input_shape = ncol(NN_train_features_short)) %>%
+  layer_dense(units = 1, activation = 'tanh') %>%
+  layer_dense(units = 1) # No activation means linear activation: f(x) = x.
+```
+
+
+```{r}
+model_ML_short %>% compile(                             # Model specification
+    loss = 'mean_squared_error',               # Loss function
+    optimizer = optimizer_rmsprop(),           # Optimisation method (weight updating)
+    metrics = c('mean_absolute_error')         # Output metric
+)
+summary(model_ML_short)  
+```
+
+```{r message=FALSE, warning=FALSE}
+fit_NN_short <- model_ML_short %>% 
+    fit(NN_train_features_short,                                 # Training features
+        NN_train_labels,                                         # Training labels
+        epochs = 15, batch_size = 256,                           # Training parameters
+        validation_data = list(NN_test_features_short, NN_test_labels) # Test data
+) 
+plot(fit_NN_short) + theme_light() 
+```
+Note: clear pattern for overfitting
+```{r}
+mean((predict(model_ML_short, NN_test_features_short) - NN_test_labels)^2)
+mean(abs(predict(model_ML_short, NN_test_features_short) - NN_test_labels))#mean squared error
+short_NN_predict <- predict(model_ML_short, NN_test_features_short)
+```
+
+```{r}
+weights_NN_short <- model_ML_short %>% get_weights()
+weights_NN_short
+```
+
+ANN(long)
+```{r}
+model_ML_long <- keras_model_sequential()
+model_ML_long %>% # This defines the structure of the network, i.e. how layers are organized
+  layer_dense(units = 8, activation = 'relu', input_shape = ncol(NN_train_features_long)) %>%
+  layer_dense(units = 4, activation = 'tanh') %>%
+  layer_dense(units = 1) # No activation means linear activation: f(x) = x.
+```
+
+```{r}
+model_ML_long %>% compile(                             # Model specification
+    loss = 'mean_squared_error',               # Loss function
+    optimizer = optimizer_rmsprop(),           # Optimisation method (weight updating)
+    metrics = c('mean_absolute_error')         # Output metric
+)
+summary(model_ML_long)  
+```
+```{r message=FALSE, warning=FALSE}
+fit_NN_long <- model_ML_long %>% 
+    fit(NN_train_features_long,                                 # Training features
+        NN_train_labels,                                         # Training labels
+        epochs = 15, batch_size = 256,                           # Training parameters
+        validation_data = list(NN_test_features_long, NN_test_labels) # Test data
+    )
+
+plot(fit_NN_long) + theme_light()# Plot, evidently!
+```
+```{r}
+mean((predict(model_ML_long, NN_test_features_long) - NN_test_labels)^2) #mean squared error
+mean(abs(predict(model_ML_long, NN_test_features_long) - NN_test_labels))
+
+long_NN_predict <- predict(model_ML_long, NN_test_features_long)
+```
+
+```{r}
+weights_NN_long <- model_ML_long %>% get_weights()
+weights_NN_long
+```
+Autoencoder
+```{r}
+normalise <- function(v){ # This is a function that 'uniformalizes' a vector
+  v <- v %>% as.matrix()
+  return(ecdf(v)(v))
+}
+
+data_norm <- data_tr %>%
+  group_by(FisYear) %>%
+  mutate_if(is.numeric, normalise) %>%
+  ungroup() %>%
+  arrange(FisYear, tick)
+
+separation_year <- 2018
+training_sample <- filter(data_norm, FisYear < separation_year)
+testing_sample <- filter(data_norm, FisYear >= separation_year)
+```
+
+
+
+```{r}
+years <- unique(training_sample$FisYear)
+N <- length(stock_ids) # Dimension for assets
+Tt <- length(years) # Dimension for dates
+K <- length(features_long) # Dimension for features
+
+factor_data <- training_sample %>%                               # Factor side date
+  dplyr::select(FisYear, tick, return) %>%
+  spread(key = tick, value = return) %>%
+  dplyr::select(-FisYear) %>%
+  as.matrix()
+
+beta_data <- array(unlist(training_sample %>% # Beta side data: beware the permutation below!
+                            dplyr::select(all_of(features_long))),
+                   dim = c(N, Tt, K))
+beta_data <- aperm(beta_data, c(2,1,3))                 # Permutation
+```
+
+```{r}
+main_input <- layer_input(shape = c(N), name = "main_input")        # Main input: returns
+factor_network <- main_input %>%         # Definition of factor side network
+  layer_dense(units = 12, activation = "relu", name = "layer_1_r") %>%
+  layer_dense(units = 4, activation = "tanh", name = "layer_2_r")
+
+aux_input <- layer_input(shape = c(N,K), name = "aux_input")         # Auxiliary input: characteristics
+beta_network <- aux_input %>%                # Definition  of beta side network
+  layer_dense(units = 12, activation = "relu", name = "layer_1_l") %>%
+  layer_dense(units = 4, activation = "tanh", name = "layer_2_l") %>%
+  layer_permute(dims = c(2,1), name = "layer_3_l") # Permutation!
+
+main_output <- layer_dot(c(beta_network, factor_network),              # Product of 2 networks
+                         axes = 1, name = "main_output")
+model_ae <- keras_model( # AE Model specs
+  inputs = c(main_input, aux_input),
+  outputs = c(main_output)
+)
+```
+
+```{r}
+model_ae %>% compile(
+  optimizer = 'rmsprop',
+  loss = 'mean_squared_error',
+  metrics = c('mean_absolute_error') 
+)
+```
+
+```{r}
+years_test <- unique(testing_sample$FisYear)
+Ttest <- length(years_test) # Dimension for dates
+
+factor_data_test <- testing_sample %>%                               # Factor side date
+  dplyr::select(FisYear, tick, return) %>%
+  spread(key = tick, value = return) %>%
+  dplyr::select(-FisYear) %>%
+  as.matrix()
+
+beta_data_test <- array(unlist(testing_sample %>% # Beta side data: beware the permutation below!
+                            dplyr::select(all_of(features_long))),
+                   dim = c(N, Ttest, K))
+beta_data_test <- aperm(beta_data_test, c(2,1,3))                 # Permutation
+```
+
+```{r}
+ae_input <- list(factor_data, beta_data)
+ae_output <- list(factor_data)
+test_input <- list(factor_data_test, beta_data_test)
+test_output <- list(factor_data_test)
+ae_fit <- model_ae %>% fit(ae_input,
+                           ae_output,
+                           epochs = 20, # Number of rounds
+                           batch_size = 49, # Length of sequences
+                           verbose = 0,
+                           validation_data = list(test_input, test_output))
+
+plot(ae_fit)
+```
+
+```{r}
+model_ae %>% evaluate(test_input, test_output)
+ae_prediction <- model_ae %>% predict(test_input)
+
+x <- filter(data_tr, FisYear >= separation_year) %>%
+  select(return) %>%
+  as.matrix()
+
+a <- min(x)
+b <- max(x)
+ae_deuni <- array(a + (b - a) * ae_prediction)
+
+plot(ae_deuni, x)
+
+```
+
+Ensemble
+```{r}
+weights = rep(1,3)/3
+
+err_LASSO <- array(predict(best.lasso.short, newx = x_penalized_test_short) - testing_sample$return)
+err_RF <- predict(fit_RF_short, testing_sample) - testing_sample$return
+err_nn <- array(short_NN_predict) - testing_sample$return
+err_AGG <- weights[1]*err_LASSO + weights[2]*err_RF + weights[3]*err_nn
+errors_short <- data.frame(err_LASSO, err_RF, err_nn, err_AGG)
+
+errors_short %>% colMeans()
+```
+
+```{r}
+errors_short %>% apply(2, sd)
+cor(errors_short[,1:3])
+
+Sigma_short <- cov(errors_short[,1:3]) # => stored in Sigma (for future use)
+w_short <- rowSums(solve(Sigma_short)) # Sum or rows inverse covariance matrix of errors
+opt_w_short <- w_short / sum(w_short) 
+
+opt_w_short
+```
+
+
+```{r}
+weights = rep(1,3)/3
+
+err_LASSO <- array(predict(best.lasso.long, newx = x_penalized_test_long) - testing_sample$return)
+err_RF <- predict(fit_RF_long, testing_sample) - testing_sample$return
+err_nn <- array(long_NN_predict) - testing_sample$return
+err_AGG <- weights[1]*err_LASSO + weights[2]*err_RF + weights[3]*err_nn
+errors_long <- data.frame(err_LASSO, err_RF, err_nn, err_AGG)
+
+errors_long %>% colMeans()
+```
+
+```{r}
+errors_long %>% apply(2, sd)
+cor(errors_long[,1:3])
+
+Sigma_long <- cov(errors_long[,1:3]) # => stored in Sigma (for future use)
+w_long <- rowSums(solve(Sigma_long)) # Sum or rows inverse covariance matrix of errors
+opt_w_long <- w_long / sum(w_long) 
+
+opt_w_long
+```
+
+
+Backtesting
+
+```{r}
+weights_pure_lasso <- function(past_data, current_data, alpha, lambda){
+  y <- past_data$return # Dependent variable
+  x <- past_data %>% # Independent variables
+    select(-tick, -FisYear, -return) %>% # Remove irrelevant columns
+    as.matrix() # Format to matrix shape
+  fit <- glmnet(x,y, alpha = alpha, lambda = lambda) # Performing the glmnet regressi
+  newx <- current_data %>% # Preparing the new data
+    select(-tick, -FisYear, -return) %>% # Remove irrelevant columns
+    as.matrix() # Format to matrix shape
+  pred <- predict(fit, newx = newx) # Launching the prediction
+  w <- pred > median(pred) # Invests only if positive predi
+  return(w/sum(w))
+}
+```
+
+```{r}
+separation_year <- 2018
+tick <- unique(data_bc$tick)
+data_lasso <- data_bc %>%
+  select(c(all_of(features_long), return, FisYear, tick))
+
+t_oos2 <- data_bc$FisYear[data_bc$FisYear>=separation_year] %>% # New dates, we take one more (prev.
+  unique() # Remove duplicates
+portf_weights <- matrix(0, nrow = length(t_oos), ncol = length(tick)) # Initialisation
+portf_returns <- c() # Initialisation
+for(t in 2:length(t_oos2)){ # Current time is t-
+  past_data <- data_lasso %>% filter(FisYear < t_oos2[t-1]) # Past data: expandi
+  current_data <- data_lasso %>% filter(FisYear == t_oos2[t-1]) # Extracting current
+  portf_weights[t-1,] <- weights_pure_lasso(past_data,current_data, 1, lambda_min_long)
+  # Hard-coded parameters above! User specified!
+  realised_returns <- returns %>% # Realised returns
+    filter(FisYear == t_oos2[t]) %>% # Note: starts at t = 2, equal to t_
+    select(-FisYear) # Take out FisYear column
+  portf_returns[t-1] <- sum(portf_weights[t-1,] * realised_returns)
+  # Note: t-1, like for the portfolios !!!
+}
+asset_returns <- filter(returns, FisYear %in% t_oos) # And not t_oos2!
+perf_met(portf_returns, portf_weights, asset_returns)
+```
+
+
+
+
+
+

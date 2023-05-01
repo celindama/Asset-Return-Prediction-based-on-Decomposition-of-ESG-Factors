@@ -1,0 +1,259 @@
+---
+title: "AFM423_Project"
+output: pdf_document
+date: "2023-03-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+```
+
+## R Markdown
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)                      # Activate the data science package
+library(lubridate)                      # Activate the date management package
+library(tidyquant)
+library(visdat)
+library(ggcorrplot)
+library(timetk)
+library(quantmod)
+```
+
+```{r message=FALSE, warning=FALSE}
+TR <- read_csv('fulldataset.csv')
+decomp <- read_csv('categorydataset.csv')
+
+# to save your time
+price_nona <- read_csv('price_nona.csv')
+```
+
+
+```{r}
+TR_firms <- unique(TR$tick)
+length(TR_firms)
+min(TR$FisYear)
+max(TR$FisYear)
+```
+
+```{r}
+TR_count <- table(TR$tick) %>% as.data.frame()
+
+ggplot(TR_count, aes(x = Freq)) +
+  geom_histogram(stat = 'count') + 
+  labs(title = 'Years of ESG ratings available') +
+  xlab('Number of years') + 
+  theme(plot.title = element_text(hjust = 0.5, size = 16))
+```
+
+
+```{r}
+TR_fismonth <- TR %>%
+  select(fyenddate, tick) %>%
+  mutate(fiscal_month = month(fyenddate)) %>%
+  group_by(tick) %>% 
+  mutate(fiscal_month = as.character(min(fiscal_month, na.rm = TRUE))) %>%
+  slice(1) %>% # taking the first example
+  select(-fyenddate) %>%
+  as.data.frame()
+TR_fismonth$fiscal_month <- factor(TR_fismonth$fiscal_month, levels = c("1", "2", "3", '4', '5', '6',
+                                                                        '7', '8', '9', '10', '11', '12'))
+
+ggplot(TR_fismonth, aes(x = fiscal_month)) +
+  geom_histogram(stat = 'count', binwidth = 1) + 
+  labs(title = 'Frequency of Fiscal Year End') +
+  xlab('Months') + 
+  theme(plot.title = element_text(hjust = 0.5, size = 16))
+```
+
+
+original dataset includes 329 companies. We then extract returns for those companies from Yahoo Finance.  
+(Note: The following chunk is set not to be run since it takes quite a long time. I've put the output in a csv and loaded it to save the time of whoever is running through this program)
+```{r eval=FALSE, include=FALSE}
+tickers = TR_firms
+
+min_date <- '2010-01-01'
+max_date <- '2022-12-31'
+
+prices <- getSymbols(tickers, src = 'yahoo',
+                     from = min_date,
+                     to = max_date,
+                     auto.assign = TRUE,
+                     warning = FALSE) %>%
+  map(~Ad(get(.))) %>%
+  reduce(merge)
+
+#adjust colname
+colnames(prices) <- substring(colnames(prices), 1, nchar(colnames(prices)) - 9)
+
+#omit stocks with non-sufficient price data
+prices_nona <- prices[, !apply(is.na(prices), 2, any)]
+ncol(prices_nona) #310 left here
+prices_nona %>%
+  as.data.frame()
+#write.csv(prices_nona, 'price_nona.csv')
+```
+
+```{r, include=FALSE}
+#dropna
+yearly_returns <- prices_nona %>% # Start from prices
+  to.yearly(indexAt = "lastof", OHLC = FALSE) %>% # Convert to yearly
+  data.frame(Date = index(.)) %>% # Convert the index to a date
+  remove_rownames() %>% # Remove index => converted into row
+  pivot_longer(-Date, names_to = "Asset",
+               values_to = "Price") %>% # Put the data in 'tidy' format
+  group_by(Asset) %>% # Group the rows by asset to compute
+  mutate(returns = Price / dplyr::lag(Price) - 1) %>% # Compute the returns
+  select(-Price) %>% # Remove price column
+  pivot_wider(names_from = "Asset",
+              values_from = "returns") %>% # Put the data back in matrix form
+  #select(Date, tickers) %>% # Keep only the relevant columns
+  na.omit() # Discard rows with missing/NA data
+#write_csv(yearly_returns, 'yearly_return.csv')
+```
+Since majority fiscal year ends at the end of December, for simplicity I will calculate yearly return based on December fiscal year end. 
+Note that we focus on stocks traded in NASDAQ and NYSE only (so mainly NA market). We should point it out while talking about scope of the project. (There are articles stating that effect varies by country, but we concentrate on NA stock markets)
+
+
+```{r}
+TR_count <- table(TR$tick) %>% as.data.frame()
+
+ggplot(TR_count, aes(x = Freq)) +
+  geom_histogram(stat = 'count') + 
+  labs(title = 'Years of ESG ratings available') +
+  xlab('Number of years') + 
+  theme(plot.title = element_text(hjust = 0.5, size = 16))
+  
+
+full_TR_ticker <- TR_count %>% filter(Freq == 12) %>% select(Var1) %>% as.list()
+full_TR <- TR %>% filter(tick %in% full_TR_ticker$Var1) %>% #keep only firms with 12 years data
+  #take out unused/empty columns:
+  select(-c(lenvrnmntl, CDFlag, feeddate, Asset4Id, BusTRBCId, OAId, Sedol, Isin,
+            StatusFlag, Cusip, fyenddate, OrgID)) 
+  
+
+vis_dat(full_TR, warn_large_data = F) 
+
+```
+Note: As shown in the histogram, while majority of the firms have ESG ratings for 12 years, some of the firms did not have rating at the beginning. The lack of data may or may not matter depending on the algorithm used. 
+After filtering out the firms with less than 12 years of data, there are still some missing values in the factor 'envrn score'. Since the NAs are all in the last two years (i.e. 2020/2021), I fill them using data from previous year. Here's the code:  
+
+```{r}
+TR_filled <- full_TR%>% 
+  arrange(., tick, FisYear) %>%
+  group_by(tick) %>% 
+  fill(envrn_score, .direction = "down") %>%#filled with previous value
+  ungroup()
+
+  
+vis_dat(TR_filled, warn_large_data = F) 
+```
+
+
+```{r}
+year_to_merge <- yearly_returns %>%
+  pivot_longer(., cols = -Date, names_to = 'tick', values_to = 'return') %>%
+  mutate(FisYear = year(Date) - 1) %>%#We use this column to merge it to the factors, return of this year corresponds to factors from last year hence -1
+  select(-Date)
+
+TR_with_return <- merge(TR_filled, year_to_merge, by = c('tick', 'FisYear'), all.x = TRUE)
+
+vis_dat(TR_with_return)
+
+TR_with_return %>%
+  filter(is.na(return)) %>%
+  select(tick) %>%
+  unique()
+
+TR_with_return <- TR_with_return %>% na.omit(return)
+vis_dat(TR_with_return)
+```
+The above companies are removed since there is no data corresponding to the tick.  
+
+Then we merge the larger dataset to it
+\newpage
+```{r}
+decomp_useful <- decomp %>%
+  select(c(Score, ControversiesScore, ResourceUseScore, EmissionsScore, InnovationScore,
+           WorkforceScore, HumanRightsScore, CommunityScore, ProductRespScore, ManagementScore,
+           ShareholdersScore, CSRStrategyScore, tick, FisYear))
+vis_dat(decomp_useful)
+```
+
+
+
+```{r}
+TR_complete <- merge(TR_with_return, decomp_useful, by = c('FisYear', 'tick'),all.x = TRUE)
+
+vis_dat(TR_complete)
+write.csv(TR_complete, 'TR_complete.csv')
+```
+
+Data description
+```{r}
+ggplot(TR_complete, aes(x = PrimExchg)) +
+  geom_histogram(stat = 'count') + 
+  labs(title = 'Distribution of Exchanges') +
+  xlab('stock exchanges') +
+  theme(plot.title = element_text(hjust = 0.5, size = 16))
+```
+
+```{r}
+TR_complete %>%
+  select(c(envrn_score, social_score, corpgov_score, ControversiesScore)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "Attribute", values_to = "Value") %>% # Convert to 'compact' colu
+  ggplot(aes(x = Value, fill = Attribute)) +
+  geom_histogram() + theme_light() + # Plot histograms
+  facet_grid(Attribute~., scales = "free") # Stack the histograms
+```
+
+```{r, fig.width= 5, fig.height= 8}
+TR_complete %>%
+  select(c(ControversiesScore, ResourceUseScore, EmissionsScore, InnovationScore,
+           WorkforceScore, HumanRightsScore, CommunityScore, ProductRespScore, ManagementScore,
+           ShareholdersScore, CSRStrategyScore)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "Attribute", values_to = "Value") %>% # Convert to 'compact' colu
+  ggplot(aes(x = Value, fill = Attribute)) +
+  geom_histogram() + theme_light() + # Plot histograms
+  facet_grid(Attribute~., scales = "free") # Stack the histograms
+```
+
+```{r}
+TR_complete %>%
+  select(c(overall_score)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "Attribute", values_to = "Value") %>% # Convert to 'compact' colu
+  ggplot(aes(x = Value, fill = Attribute)) +
+  geom_histogram() + theme_light() + # Plot histograms
+  facet_grid(Attribute~., scales = "free") # Stack the histograms
+```
+
+```{r}
+TR_complete %>%
+  select(c(return)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "Attribute", values_to = "Value") %>% # Convert to 'compact' colu
+  ggplot(aes(x = Value, fill = Attribute)) +
+  geom_histogram() + theme_light() + # Plot histograms
+  facet_grid(Attribute~., scales = "free") # Stack the histograms
+```
+
+```{r}
+TR_complete %>%
+  select(c(envrn_score, social_score, corpgov_score, ControversiesScore)) %>%
+  cor() %>% round(3) %>% # Correlation matrix
+  ggcorrplot(type = "upper", lab = TRUE)
+```
+
+```{r}
+TR_complete %>%
+  select(c(ControversiesScore, ResourceUseScore, EmissionsScore, InnovationScore,
+           WorkforceScore, HumanRightsScore, CommunityScore, ProductRespScore, ManagementScore,
+           ShareholdersScore, CSRStrategyScore)) %>%
+  cor() %>% round(3) %>% # Correlation matrix
+  ggcorrplot(type = "upper", lab = TRUE, lab_size = 2.5) 
+```
+
